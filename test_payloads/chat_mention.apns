@@ -1,0 +1,17 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - frank mentioned you in chat",
+      "body": "@haolu you still have that spare sprocket?"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700005"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/chat/c/parts-swap/12/99",
+  "notification_type": "29",
+  "channel_id": "12",
+  "is_direct_message_channel": "false",
+  "username": "frank"
+}

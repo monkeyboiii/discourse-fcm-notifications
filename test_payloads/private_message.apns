@@ -1,0 +1,18 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - PM from charlie",
+      "body": "Are you coming to the group ride Saturday?"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700002"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/t/saturday-ride/105/1",
+  "notification_type": "6",
+  "topic_id": "105",
+  "post_number": "1",
+  "slug": "saturday-ride",
+  "username": "charlie"
+}

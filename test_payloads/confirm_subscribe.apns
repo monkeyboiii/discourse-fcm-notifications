@@ -1,0 +1,13 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - Push Notifications Enabled",
+      "body": "You have successfully subscribed to push notifications."
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700009"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com"
+}

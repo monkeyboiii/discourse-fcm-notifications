@@ -1,0 +1,17 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - New message in #general",
+      "body": "Anyone selling a set of used plastics for a KX250?"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700004"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/chat/c/general/7/42",
+  "notification_type": "30",
+  "channel_id": "7",
+  "is_direct_message_channel": "false",
+  "username": "eve"
+}

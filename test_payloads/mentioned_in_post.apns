@@ -1,0 +1,18 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - bob mentioned you",
+      "body": "@haolu check out this sick 450 build"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700001"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/t/my-crf450r-build/88/3",
+  "notification_type": "1",
+  "topic_id": "88",
+  "post_number": "3",
+  "slug": "my-crf450r-build",
+  "username": "bob"
+}

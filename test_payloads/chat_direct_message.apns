@@ -1,0 +1,17 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - DM from grace",
+      "body": "I'll bring the truck to haul bikes"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700006"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/chat/c/-/25/8",
+  "notification_type": "30",
+  "channel_id": "25",
+  "is_direct_message_channel": "true",
+  "username": "grace"
+}

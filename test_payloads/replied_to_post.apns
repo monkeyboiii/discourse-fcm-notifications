@@ -1,0 +1,18 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - alice replied",
+      "body": "Hey, have you tried the new trail out by Red Rock?"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700000"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/t/best-trails-in-utah/42/7",
+  "notification_type": "2",
+  "topic_id": "42",
+  "post_number": "7",
+  "slug": "best-trails-in-utah",
+  "username": "alice"
+}

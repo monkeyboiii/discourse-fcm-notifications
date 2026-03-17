@@ -1,0 +1,18 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - henry quoted you",
+      "body": "Totally agree about the suspension setup"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700007"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/t/suspension-tuning-guide/56/4",
+  "notification_type": "3",
+  "topic_id": "56",
+  "post_number": "4",
+  "slug": "suspension-tuning-guide",
+  "username": "henry"
+}

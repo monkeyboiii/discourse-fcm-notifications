@@ -1,0 +1,15 @@
+{
+  "aps": {
+    "alert": {
+      "title": "dirtbikebros - ivan created a new topic",
+      "body": "2024 KTM 300 XC-W first impressions"
+    },
+    "sound": "default",
+    "interruption-level": "active",
+    "category": "1710700008"
+  },
+  "linked_obj_type": "link",
+  "linked_obj_data": "https://forum.dirtbikebros.com/u/ivan",
+  "notification_type": "801",
+  "username": "ivan"
+}
