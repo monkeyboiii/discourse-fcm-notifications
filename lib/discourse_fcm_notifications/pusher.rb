@@ -16,7 +16,8 @@ module ::DiscourseFcmNotifications
           username: payload[:username]
         ),
         message: payload[:excerpt],
-        url: "#{Discourse.base_url}/#{payload[:post_url]}"
+        url: "#{Discourse.base_url}/#{payload[:post_url]}",
+        routing_data: build_routing_data(payload)
       }
       self.send_notification(user, message)
     end
@@ -57,9 +58,35 @@ module ::DiscourseFcmNotifications
       user.save_custom_fields(true)
     end
 
+    def self.extract_slug_from_post_url(post_url)
+      return nil if post_url.blank?
+      match = post_url.match(%r{/t/([^/]+)/})
+      match[1] if match
+    end
+
+    def self.build_routing_data(payload)
+      data = {}
+      data["notification_type"] = payload[:notification_type].to_s if payload[:notification_type]
+
+      if payload[:channel_id]
+        data["channel_id"] = payload[:channel_id].to_s
+        data["is_direct_message_channel"] = payload[:is_direct_message_channel].to_s if payload.key?(:is_direct_message_channel)
+      end
+
+      if payload[:topic_id]
+        data["topic_id"] = payload[:topic_id].to_s
+        data["post_number"] = payload[:post_number].to_s if payload[:post_number]
+        slug = extract_slug_from_post_url(payload[:post_url])
+        data["slug"] = slug if slug
+      end
+
+      data["username"] = payload[:username] if payload[:username]
+      data
+    end
+
     private
 
-    def self.send_notification(user, message_hash) 
+    def self.send_notification(user, message_hash)
       if user and message_hash and !self.already_sent?(user) 
         Rails.logger.info "Sending a notification to #{user.username} about #{message_hash[:title]}"
         filename = "gcp_key.json"
@@ -75,7 +102,7 @@ module ::DiscourseFcmNotifications
           'data': {
             "linked_obj_type" => 'link',
             "linked_obj_data" => message_hash[:url],
-          },
+          }.merge(message_hash[:routing_data] || {}),
           'notification': {
             title: message_hash[:title],
             body: message_hash[:message],
