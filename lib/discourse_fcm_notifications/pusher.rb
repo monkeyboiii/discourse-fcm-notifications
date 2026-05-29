@@ -265,10 +265,14 @@ module ::DiscourseFcmNotifications
         key_id: SiteSetting.fcm_notifications_apns_key_id,
         team_id: SiteSetting.fcm_notifications_apns_team_id
       }
+      # apnotic requires a block to configure each pooled connection.
+      on_connection = proc do |connection|
+        connection.on(:error) { |exception| Rails.logger.error "APNs connection error: #{exception}" }
+      end
       if development
-        Apnotic::ConnectionPool.development(options, size: 5)
+        Apnotic::ConnectionPool.development(options, { size: 5 }, &on_connection)
       else
-        Apnotic::ConnectionPool.new(options, size: 5)
+        Apnotic::ConnectionPool.new(options, { size: 5 }, &on_connection)
       end
     end
 
