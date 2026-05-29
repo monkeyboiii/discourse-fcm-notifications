@@ -7,16 +7,20 @@ module ::DiscourseFcmNotifications
     skip_before_action :preload_json
 
     def automatic_subscribe
+      device_id = params[:device_id]
       if params[:token] == "REMOVE"
-        DiscourseFcmNotifications::Pusher.unsubscribe(current_user)
+        DiscourseFcmNotifications::Pusher.unsubscribe(current_user, device_id)
         render json: { success: 'SUCCESS' }
       else
-        DiscourseFcmNotifications::Pusher.subscribe(current_user, params[:token])
-        if DiscourseFcmNotifications::Pusher.confirm_subscribe(current_user)
-          #flash.now[:notice] = "You have successfully subscribed to push notifications."
+        changed = DiscourseFcmNotifications::Pusher.subscribe(current_user, params[:token], device_id)
+        # Only send the "subscribed!" confirmation push when this device's token
+        # actually changed — the app re-subscribes on every launch, and we don't
+        # want to ping the user's devices each time.
+        if !changed
+          render json: { success: 'SUCCESS' }
+        elsif DiscourseFcmNotifications::Pusher.confirm_subscribe(current_user)
           render json: { success: 'SUCCESS' }
         else
-          #flash.now[:alert] = "There was an error subscribing to push notifications."
           render json: { failed: 'FAILED', error: I18n.t("discourse_fcm_notifications.subscribe_error") }
         end
       end
