@@ -282,15 +282,28 @@ module ::DiscourseFcmNotifications
     end
 
     # Writes the .p8 auth key to a file (apnotic wants a path), mirroring the
-    # gcp_key.json pattern. Note: like that pattern, an existing file is not
-    # rewritten — bump the filename or delete it if the key setting changes.
+    # gcp_key.json pattern. Always (re)writes from the current setting via
+    # `normalize_p8`, so correcting the setting takes effect without a stale file.
     def self.ensure_apns_key_file!
       filename = "apns_key.p8"
-      if !File.exist?(filename) && SiteSetting.fcm_notifications_apns_p8.present?
-        File.open(filename, "w") { |file| file.write(SiteSetting.fcm_notifications_apns_p8) }
-      end
-      raise "Error: Missing APNs .p8 auth key for push notifications" unless File.exist?(filename)
+      raw = SiteSetting.fcm_notifications_apns_p8.to_s
+      raise "Error: Missing APNs .p8 auth key for push notifications" if raw.strip.blank?
+      # Always (re)write so a corrected setting takes effect (no stale-file trap).
+      File.write(filename, normalize_p8(raw))
       filename
+    end
+
+    # Rebuild a clean PKCS#8 PEM (Apple .p8 format) from however the key was
+    # pasted into the (often single-line) site-setting field — full PEM with real,
+    # escaped ("\n"), or space-collapsed newlines, or just the inner base64. We
+    # strip the markers + all whitespace down to the base64 body, then re-wrap.
+    def self.normalize_p8(raw)
+      body = raw.to_s
+                .gsub('\n', "\n")
+                .gsub(/-----BEGIN[A-Z ]*-----/, "")
+                .gsub(/-----END[A-Z ]*-----/, "")
+                .gsub(/\s+/, "")
+      "-----BEGIN PRIVATE KEY-----\n#{body.scan(/.{1,64}/).join("\n")}\n-----END PRIVATE KEY-----\n"
     end
   end
 
