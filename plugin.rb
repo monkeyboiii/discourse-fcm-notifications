@@ -12,6 +12,10 @@ gem 'os', '1.1.4'
 gem 'memoist', '0.16.2'
 gem 'googleauth', '1.7.0'
 gem 'fcm', '1.0.8'
+# Direct APNs delivery (HTTP/2 + .p8 token auth) — the iOS push path that bypasses
+# FCM/Google entirely so token registration works in China without a VPN. Bundler
+# pulls apnotic's deps (net-http2, http-2; connection_pool ships with core).
+gem 'apnotic', '1.7.0'
 
 module ::DiscourseFcmNotifications
   PLUGIN_NAME = "discourse-fcm-notifications"

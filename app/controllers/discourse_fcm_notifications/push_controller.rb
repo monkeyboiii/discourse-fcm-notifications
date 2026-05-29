@@ -12,7 +12,13 @@ module ::DiscourseFcmNotifications
         DiscourseFcmNotifications::Pusher.unsubscribe(current_user, device_id)
         render json: { success: 'SUCCESS' }
       else
-        changed = DiscourseFcmNotifications::Pusher.subscribe(current_user, params[:token], device_id)
+        changed = DiscourseFcmNotifications::Pusher.subscribe(
+          current_user,
+          params[:token],
+          device_id,
+          params[:environment],
+          params[:platform]
+        )
         # Only send the "subscribed!" confirmation push when this device's token
         # actually changed — the app re-subscribes on every launch, and we don't
         # want to ping the user's devices each time.

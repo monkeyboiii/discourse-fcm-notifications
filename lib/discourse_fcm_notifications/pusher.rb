@@ -1,9 +1,12 @@
 # frozen_string_literal: true
 
-require "net/https"
-
 module ::DiscourseFcmNotifications
   class Pusher
+    # Memoized APNs connection pools (per process), one per environment. Reused
+    # across Sidekiq jobs so JWT auth tokens aren't regenerated per push.
+    @@apns_pool_prod = nil
+    @@apns_pool_dev = nil
+
     def self.push(user, payload)
       message = {
         title: I18n.t(
@@ -31,52 +34,76 @@ module ::DiscourseFcmNotifications
       self.send_notification(user, message)
     end
 
-    # The user's registered device tokens as a Hash of device_id => token.
-    # Tolerates three stored shapes so upgrades are seamless:
-    #   - Hash   — current multi-device format
-    #   - String — legacy single-token format (pre multi-device)
-    #   - nil / blank — no subscription
-    def self.tokens_map(user)
+    # The user's registered devices as a Hash of device_id => entry, where each
+    # entry is { "token" =>, "env" =>, "platform" => }. Tolerates older stored
+    # shapes so upgrades are seamless:
+    #   - Hash of device_id => entry-hash  (current multi-device format)
+    #   - Hash of device_id => token-string (pre-APNs; treated as ios/production)
+    #   - String (legacy single-token format)
+    #   - nil / blank (no subscription)
+    def self.devices_map(user)
       raw = user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME]
       case raw
       when Hash
-        raw.reject { |_, v| v.blank? }
+        raw.each_with_object({}) do |(device_id, value), acc|
+          entry = normalize_entry(value)
+          acc[device_id] = entry if entry
+        end
       when String
-        raw.blank? ? {} : { "legacy" => raw }
+        raw.blank? ? {} : { "legacy" => { "token" => raw, "env" => "production", "platform" => "ios" } }
       else
         {}
       end
     end
 
-    # subscription = FCM registration token from the device.
+    def self.normalize_entry(value)
+      if value.is_a?(Hash)
+        token = value["token"]
+        return nil if token.blank?
+        {
+          "token" => token,
+          "env" => value["env"].presence || "production",
+          "platform" => value["platform"].presence || "ios"
+        }
+      elsif value.is_a?(String) && value.present?
+        { "token" => value, "env" => "production", "platform" => "ios" }
+      end
+    end
+
+    # subscription = device push token (APNs hex for iOS).
     # device_id    = stable per-device id so re-subscribing one device replaces
-    #                only its own token (multi-device safe). Defaults to "legacy"
-    #                for old callers that don't send one.
-    # Returns true when this device's token is new or changed (caller uses this
-    # to decide whether to send the "subscribed!" confirmation push, so the
-    # per-launch re-subscribe stays silent).
-    def self.subscribe(user, subscription, device_id = nil)
+    #                only its own slot (multi-device safe). Defaults to "legacy".
+    # env          = "sandbox" | "production" (APNs host hint, iOS).
+    # platform     = "ios" (default) | "android" (future).
+    # Returns true when this device's token/env/platform changed (caller uses
+    # this to decide whether to send the confirmation push).
+    def self.subscribe(user, subscription, device_id = nil, env = nil, platform = nil)
       return false if subscription.blank?
       device_id = device_id.presence || "legacy"
+      entry = {
+        "token" => subscription,
+        "env" => env.presence || "production",
+        "platform" => platform.presence || "ios"
+      }
 
-      map = tokens_map(user)
+      map = devices_map(user)
       previous = map[device_id]
       # Drop stale entries holding this same token under a different device_id
       # (token migrated devices, or a reinstall reissued it).
-      map.reject! { |did, tok| tok == subscription && did != device_id }
-      map[device_id] = subscription
+      map.reject! { |did, e| e["token"] == subscription && did != device_id }
+      map[device_id] = entry
 
       user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
       user.save_custom_fields(true)
 
-      previous != subscription
+      previous != entry
     end
 
     # Remove one device's token (device_id given) or every token (device_id nil,
-    # e.g. the legacy "REMOVE all" behaviour and the 404 cleanup fallback).
+    # e.g. the legacy "REMOVE all" behaviour and the dead-token cleanup fallback).
     def self.unsubscribe(user, device_id = nil)
       if device_id.present?
-        map = tokens_map(user)
+        map = devices_map(user)
         map.delete(device_id)
         if map.empty?
           user.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
@@ -118,32 +145,40 @@ module ::DiscourseFcmNotifications
     def self.send_notification(user, message_hash)
       return false unless user && message_hash
 
-      map = tokens_map(user)
+      map = devices_map(user)
       if map.empty?
-        Rails.logger.info "FCM: no device tokens registered for #{user.username}, skipping push about #{message_hash[:title]}"
+        Rails.logger.info "Push: no device tokens registered for #{user.username}, skipping push about #{message_hash[:title]}"
         return false
       end
-
-      ensure_gcp_key!
-      fcm = FCM.new(SiteSetting.fcm_notifications_api_key, "gcp_key.json", SiteSetting.fcm_notifications_project_id)
 
       sent_any = false
       dead_device_ids = []
 
-      map.each do |device_id, token|
-        next if token.blank?
-        response = fcm.send_v1(build_fcm_message(token, message_hash))
-
-        if response[:response] == 'success'
-          Rails.logger.info "FCM: sent '#{message_hash[:title]}' to #{user.username} (device #{device_id})"
-          sent_any = true
-        elsif response[:status_code] == 404
-          Rails.logger.error "FCM: token for #{user.username} (device #{device_id}) is no longer valid; removing it"
-          dead_device_ids << device_id
-        elsif response[:status_code] == 400
-          Rails.logger.error "FCM: malformed message for #{user.username} (device #{device_id}); body: #{response[:body]}"
+      map.each do |device_id, entry|
+        case entry["platform"]
+        when "ios"
+          result, used_env = send_apns(entry["token"], entry["env"], message_hash)
+          case result
+          when :ok
+            sent_any = true
+            Rails.logger.info "APNs: sent '#{message_hash[:title]}' to #{user.username} (device #{device_id}, env #{used_env})"
+            # Self-correct a wrong env hint discovered via BadDeviceToken.
+            if used_env != entry["env"]
+              entry["env"] = used_env
+              map[device_id] = entry
+              user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
+              user.save_custom_fields(true)
+            end
+          when :dead
+            Rails.logger.error "APNs: token for #{user.username} (device #{device_id}) is no longer valid; removing it"
+            dead_device_ids << device_id
+          else
+            Rails.logger.error "APNs: failed to send to #{user.username} (device #{device_id})"
+          end
         else
-          Rails.logger.error "FCM: error #{response[:status_code]} for #{user.username} (device #{device_id}); body: #{response[:body]}"
+          # Non-iOS platforms (e.g. Android/FCM) are not implemented. Placeholder
+          # branch so adding a sender later is localized to here.
+          Rails.logger.info "Push: platform '#{entry["platform"]}' not implemented for #{user.username} (device #{device_id}), skipping"
         end
       end
 
@@ -151,44 +186,107 @@ module ::DiscourseFcmNotifications
       sent_any
     end
 
-    def self.ensure_gcp_key!
-      filename = "gcp_key.json"
-      if !File.exist?(filename) && SiteSetting.fcm_notifications_google_json
-        File.open(filename, 'w') { |file| file.write(SiteSetting.fcm_notifications_google_json) }
+    # Returns [result, used_env] where result is :ok | :dead | :error.
+    # On BadDeviceToken (token belongs to the other APNs environment) retries the
+    # opposite host and reports the env that actually worked.
+    def self.send_apns(token, env, message_hash)
+      env = env.presence || "production"
+      response = deliver_apns(token, env, message_hash)
+      return [:ok, env] if response&.ok?
+
+      case apns_reason(response)
+      when "BadDeviceToken"
+        other = (env == "production" ? "sandbox" : "production")
+        retry_response = deliver_apns(token, other, message_hash)
+        if retry_response&.ok?
+          [:ok, other]
+        elsif %w[Unregistered BadDeviceToken].include?(apns_reason(retry_response))
+          [:dead, env]
+        else
+          Rails.logger.error "APNs retry error: status=#{retry_response&.status} body=#{retry_response&.body}"
+          [:error, env]
+        end
+      when "Unregistered"
+        [:dead, env]
+      else
+        Rails.logger.error "APNs error: status=#{response&.status} body=#{response&.body}"
+        [:error, env]
       end
-      raise "Error: Missing google json for push notifications" unless File.exist?(filename)
     end
 
-    def self.build_fcm_message(token, message_hash)
-      {
-        'token': token,
-        'data': {
-          "linked_obj_type" => 'link',
-          "linked_obj_data" => message_hash[:url],
-        }.merge(message_hash[:routing_data] || {}),
-        'notification': {
-          title: message_hash[:title],
-          body: message_hash[:message],
-        },
-        'android': {
-          "priority": "normal",
-        },
-        'apns': {
-          headers: {
-            "apns-priority": "5"
-          },
-          payload: {
-            aps: {
-              "category": "#{Time.zone.now.to_i}",
-              "sound": "default",
-              "interruption-level": "active"
-            }
-          },
-        },
-        'fcm_options': {
-          "analytics_label": "Label"
-        }
+    def self.apns_reason(response)
+      body = response&.body
+      body.is_a?(Hash) ? body["reason"] : nil
+    end
+
+    def self.deliver_apns(token, env, message_hash)
+      apns_pool(env).with do |connection|
+        connection.push(build_apns_notification(token, message_hash))
+      end
+    rescue => e
+      Rails.logger.error "APNs delivery exception (env #{env}): #{e.class}: #{e.message}"
+      # Drop the memoized pool so a broken connection is rebuilt next time.
+      reset_apns_pools
+      nil
+    end
+
+    def self.build_apns_notification(token, message_hash)
+      notification = Apnotic::Notification.new(token)
+
+      alert = { title: message_hash[:title] }
+      alert[:body] = message_hash[:message] if message_hash[:message].present?
+      notification.alert = alert
+
+      notification.topic = SiteSetting.fcm_notifications_apns_topic
+      notification.sound = "default"
+      notification.priority = 10
+      notification.apns_push_type = "alert" if notification.respond_to?(:apns_push_type=)
+
+      notification.custom_payload = {
+        "linked_obj_type" => "link",
+        "linked_obj_data" => message_hash[:url]
+      }.merge(message_hash[:routing_data] || {})
+
+      notification
+    end
+
+    def self.apns_pool(env)
+      if env == "sandbox"
+        @@apns_pool_dev ||= build_apns_pool(development: true)
+      else
+        @@apns_pool_prod ||= build_apns_pool(development: false)
+      end
+    end
+
+    def self.build_apns_pool(development:)
+      options = {
+        auth_method: :token,
+        cert_path: ensure_apns_key_file!,
+        key_id: SiteSetting.fcm_notifications_apns_key_id,
+        team_id: SiteSetting.fcm_notifications_apns_team_id
       }
+      if development
+        Apnotic::ConnectionPool.development(options, size: 5)
+      else
+        Apnotic::ConnectionPool.new(options, size: 5)
+      end
+    end
+
+    def self.reset_apns_pools
+      @@apns_pool_prod = nil
+      @@apns_pool_dev = nil
+    end
+
+    # Writes the .p8 auth key to a file (apnotic wants a path), mirroring the
+    # gcp_key.json pattern. Note: like that pattern, an existing file is not
+    # rewritten — bump the filename or delete it if the key setting changes.
+    def self.ensure_apns_key_file!
+      filename = "apns_key.p8"
+      if !File.exist?(filename) && SiteSetting.fcm_notifications_apns_p8.present?
+        File.open(filename, "w") { |file| file.write(SiteSetting.fcm_notifications_apns_p8) }
+      end
+      raise "Error: Missing APNs .p8 auth key for push notifications" unless File.exist?(filename)
+      filename
     end
   end
 

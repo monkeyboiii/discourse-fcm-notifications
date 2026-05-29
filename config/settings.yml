@@ -8,3 +8,12 @@ plugins:
     default: ''
   fcm_notifications_google_json:
     default: ''
+  fcm_notifications_apns_key_id:
+    default: ''
+  fcm_notifications_apns_team_id:
+    default: ''
+  fcm_notifications_apns_p8:
+    default: ''
+    secret: true
+  fcm_notifications_apns_topic:
+    default: 'com.dirtbikex.app'

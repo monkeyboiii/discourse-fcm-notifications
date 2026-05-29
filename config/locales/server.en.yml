@@ -4,6 +4,10 @@ en:
     fcm_notifications_project_id: Firebase project ID
     fcm_notifications_api_key: Your Firebase key
     fcm_notifications_google_json: Complete content of json file
+    fcm_notifications_apns_key_id: "APNs auth key ID (10 chars, e.g. 5RASC3JWV7)"
+    fcm_notifications_apns_team_id: "Apple Developer Team ID (10 chars)"
+    fcm_notifications_apns_p8: "APNs auth key (.p8) file contents"
+    fcm_notifications_apns_topic: "APNs topic (app bundle id, e.g. com.dirtbikex.app)"
   discourse_fcm_notifications:
     confirm_title: 'App Notifications - %{site_title}'
     confirm_body: 'App notifications have been enabled!'
