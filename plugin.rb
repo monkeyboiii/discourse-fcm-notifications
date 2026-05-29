@@ -38,6 +38,36 @@ after_initialize do
     end
   end
 
+  # Notification types that ALREADY fire `:push_notification` (handled above), so the
+  # `:notification_created` listener below must skip them to avoid double-pushing:
+  #   - core NOTIFIABLE_TYPES
+  #   - chat types (chat plugin's NotifyWatching / NotifyMentioned)
+  #   - following_created_topic/replied (discourse-follow alerts directly)
+  #   - assigned (discourse-assign), question_answer_user_commented (discourse-post-voting)
+  fcm_already_pushed_types =
+    (
+      PostAlerter::NOTIFIABLE_TYPES +
+        Notification.types.values_at(
+          :chat_mention, :chat_message, :chat_invitation,
+          :chat_group_mention, :chat_quoted, :chat_watched_thread,
+          :following_created_topic, :following_replied,
+          :assigned, :question_answer_user_commented
+        ).compact
+    ).to_set
+
+  # Broaden coverage: every other notification ROW (likes, reactions, new follows,
+  # bookmark reminders, badges, …) pushes via this listener. The token-presence guard
+  # avoids enqueuing jobs for users without a registered device.
+  DiscourseEvent.on(:notification_created) do |notification|
+    next unless SiteSetting.fcm_notifications_enabled?
+    next if fcm_already_pushed_types.include?(notification.notification_type)
+    next unless UserCustomField.where(
+      user_id: notification.user_id,
+      name: DiscourseFcmNotifications::PLUGIN_NAME
+    ).exists?
+    Jobs.enqueue(:send_fcm_notification_for_row, notification_id: notification.id)
+  end
+
   #DiscourseEvent.on(:user_logged_out) do |user|
   #  if SiteSetting.fcm_notifications_enabled?
   #    DiscourseFcmNotifications::Pusher.unsubscribe(user)
@@ -53,6 +83,16 @@ after_initialize do
 
         user = User.find(args[:user_id])
         DiscourseFcmNotifications::Pusher.push(user, args[:payload])
+      end
+    end
+
+    class SendFcmNotificationForRow < ::Jobs::Base
+      def execute(args)
+        return unless SiteSetting.fcm_notifications_enabled?
+
+        notification = Notification.find_by(id: args[:notification_id])
+        return if notification.nil?
+        DiscourseFcmNotifications::Pusher.push_for_notification(notification)
       end
     end
   end

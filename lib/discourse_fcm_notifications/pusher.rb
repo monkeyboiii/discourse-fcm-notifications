@@ -9,9 +9,9 @@ module ::DiscourseFcmNotifications
 
     def self.push(user, payload)
       message = {
-        title: I18n.t(
-          "discourse_fcm_notifications.popup.#{Notification.types[payload[:notification_type]]}",
-          site_title: SiteSetting.title,
+        title: notification_title(
+          payload[:notification_type],
+          translated_title: payload[:translated_title],
           topic: payload[:topic_title],
           username: payload[:username]
         ),
@@ -22,6 +22,23 @@ module ::DiscourseFcmNotifications
       self.send_notification(user, message)
     end
 
+    # Resolve the banner title for a notification type. Order:
+    #   1. a server-localized title carried in the payload (chat sets this)
+    #   2. the per-type `popup.<type>` translation
+    #   3. a generic `popup.default` fallback — so no type ever shows the raw
+    #      "translation missing: …popup.<type>" string on the lock screen.
+    def self.notification_title(notification_type, translated_title: nil, topic: nil, username: nil)
+      return translated_title if translated_title.present?
+      type_name = Notification.types[notification_type]
+      I18n.t(
+        "discourse_fcm_notifications.popup.#{type_name}",
+        site_title: SiteSetting.title,
+        topic: topic,
+        username: username,
+        default: I18n.t("discourse_fcm_notifications.popup.default", site_title: SiteSetting.title)
+      )
+    end
+
     def self.confirm_subscribe(user)
       message = {
         title: I18n.t(
@@ -30,6 +47,42 @@ module ::DiscourseFcmNotifications
         ),
         message: I18n.t("discourse_fcm_notifications.confirm_body"),
         url: "#{Discourse.base_url}"
+      }
+      self.send_notification(user, message)
+    end
+
+    # Push a notification built straight from a `Notification` row. Used by the
+    # `:notification_created` listener for types that don't fire `:push_notification`
+    # on their own (likes, reactions, new follows, etc.). Routing fields are
+    # string-typed to match the iOS `PushPayloadParser`.
+    def self.push_for_notification(notification)
+      user = notification.user
+      return false if user.nil? || user.do_not_disturb?
+
+      data = notification.data_hash || {}
+      username = data[:display_username] || data[:username]
+      type = notification.notification_type
+
+      routing = { "notification_type" => type.to_s }
+      if notification.topic_id
+        post_number = notification.post_number || 1
+        slug = Topic.where(id: notification.topic_id).pick(:slug)
+        routing["topic_id"] = notification.topic_id.to_s
+        routing["post_number"] = post_number.to_s
+        routing["slug"] = slug if slug.present?
+        url = "#{Discourse.base_url}/t/#{slug.presence || '-'}/#{notification.topic_id}/#{post_number}"
+      elsif username.present?
+        routing["username"] = username
+        url = "#{Discourse.base_url}/u/#{username}"
+      else
+        url = Discourse.base_url
+      end
+
+      message = {
+        title: notification_title(type, topic: data[:topic_title], username: username),
+        message: data[:topic_title] || data[:description] || "",
+        url: url,
+        routing_data: routing
       }
       self.send_notification(user, message)
     end
