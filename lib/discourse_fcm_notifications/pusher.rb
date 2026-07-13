@@ -149,7 +149,11 @@ module ::DiscourseFcmNotifications
       user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
       user.save_custom_fields(true)
 
-      previous != entry
+      changed = previous != entry
+      if changed
+        record_metric("discourse_fcm_device_subscribe_total", "FCM device registrations (new or changed token)", { platform: entry["platform"], env: entry["env"] })
+      end
+      changed
     end
 
     # Remove one device's token (device_id given) or every token (device_id nil,
@@ -214,6 +218,7 @@ module ::DiscourseFcmNotifications
           case result
           when :ok
             sent_any = true
+            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "ok", env: used_env })
             Rails.logger.info "APNs: sent '#{message_hash[:title]}' to #{user.username} (device #{device_id}, env #{used_env})"
             # Self-correct a wrong env hint discovered via BadDeviceToken.
             if used_env != entry["env"]
@@ -223,9 +228,11 @@ module ::DiscourseFcmNotifications
               user.save_custom_fields(true)
             end
           when :dead
+            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "dead", env: entry["env"] })
             Rails.logger.error "APNs: token for #{user.username} (device #{device_id}) is no longer valid; removing it"
             dead_device_ids << device_id
           else
+            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "error", env: entry["env"] })
             Rails.logger.error "APNs: failed to send to #{user.username} (device #{device_id})"
           end
         else
@@ -332,6 +339,24 @@ module ::DiscourseFcmNotifications
     def self.reset_apns_pools
       @@apns_pool_prod = nil
       @@apns_pool_dev = nil
+    end
+
+    # Prometheus counters via discourse-prometheus (InternalMetric::Custom), exposed
+    # on the existing app:9405 endpoint — no new infra. Cheap + low-cardinality:
+    # labels are bounded (env / platform / result), NEVER per-user or per-token.
+    # No-op when discourse-prometheus isn't loaded. Dashboard: the monitoring repo's
+    # grafana/dashboards/dbx-push.json.
+    def self.record_metric(name, description, labels = {})
+      return unless defined?(::DiscoursePrometheus::InternalMetric::Custom) && $prometheus_client
+      metric = ::DiscoursePrometheus::InternalMetric::Custom.new
+      metric.type = "Counter"
+      metric.name = name
+      metric.description = description
+      metric.labels = labels
+      metric.value = 1
+      $prometheus_client.send_json(metric.to_h)
+    rescue => e
+      Rails.logger.warn("discourse-fcm-notifications: metric emit failed: #{e.class}: #{e.message}")
     end
 
     # Writes the .p8 auth key to a file (apnotic wants a path), mirroring the
