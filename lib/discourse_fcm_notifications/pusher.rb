@@ -151,7 +151,7 @@ module ::DiscourseFcmNotifications
 
       changed = previous != entry
       if changed
-        record_metric("discourse_fcm_device_subscribe_total", "FCM device registrations (new or changed token)", { platform: entry["platform"], env: entry["env"] })
+        record_metric("fcm_device_subscribe_total", "FCM device registrations (new or changed token)", { platform: entry["platform"], env: entry["env"] })
       end
       changed
     end
@@ -218,7 +218,7 @@ module ::DiscourseFcmNotifications
           case result
           when :ok
             sent_any = true
-            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "ok", env: used_env })
+            record_metric("fcm_push_total", "APNs push send outcomes", { result: "ok", env: used_env })
             Rails.logger.info "APNs: sent '#{message_hash[:title]}' to #{user.username} (device #{device_id}, env #{used_env})"
             # Self-correct a wrong env hint discovered via BadDeviceToken.
             if used_env != entry["env"]
@@ -228,11 +228,11 @@ module ::DiscourseFcmNotifications
               user.save_custom_fields(true)
             end
           when :dead
-            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "dead", env: entry["env"] })
+            record_metric("fcm_push_total", "APNs push send outcomes", { result: "dead", env: entry["env"] })
             Rails.logger.error "APNs: token for #{user.username} (device #{device_id}) is no longer valid; removing it"
             dead_device_ids << device_id
           else
-            record_metric("discourse_fcm_push_total", "APNs push send outcomes", { result: "error", env: entry["env"] })
+            record_metric("fcm_push_total", "APNs push send outcomes", { result: "error", env: entry["env"] })
             Rails.logger.error "APNs: failed to send to #{user.username} (device #{device_id})"
           end
         else
