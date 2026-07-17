@@ -26,7 +26,7 @@ Discourse core fires :push_notification event      Any other Notification row is
 | `lib/discourse_fcm_notifications/pusher.rb` | Core logic: builds APNs notification (apnotic), manages per-device subscription map, sandbox/production connection pools with BadDeviceToken env retry + self-correction, dead-token cleanup |
 | `lib/discourse_fcm_notifications/engine.rb` | Rails engine setup, autoload paths |
 | `app/controllers/.../push_controller.rb` | Subscription endpoints: `automatic_subscribe`, `subscribe`, `unsubscribe` |
-| `config/routes.rb` | `GET /fcm_notifications/automatic_subscribe`, `POST subscribe/unsubscribe` |
+| `config/routes.rb` | `POST /fcm_notifications/automatic_subscribe` (+ legacy GET, XHR-gated), `POST subscribe/unsubscribe` |
 | `config/settings.yml` | Site settings: `enabled`, APNs `key_id`/`team_id`/`p8`/`topic`, plus legacy unused `project_id`/`api_key`/`google_json` |
 | `config/locales/server.en.yml` | Notification title translations per type |
 | `config/locales/client.en.yml` | UI labels for preferences panel |
@@ -74,7 +74,22 @@ Chat payloads originate from `Chat::NotifyWatching` (`plugins/chat/app/jobs/regu
 
 ## Device Token Storage
 
-Stored as `user.custom_fields["discourse-fcm-notifications"]` — no migrations, no extra tables. It is a JSON map of `device_id => { token, env, platform }` (multi-device; a dead token removes only its own slot). Legacy shapes (bare token string, or `device_id => token-string`) are still parsed as ios/production. The `automatic_subscribe` endpoint is what native apps call with their APNs device token plus `device_id`, `environment` (`sandbox`/`production`), and `platform`; `token=REMOVE` unsubscribes, and the confirmation push is sent only when the device's entry actually changed.
+Stored as `user.custom_fields["discourse-fcm-notifications"]` — no migrations, no extra tables. It is a JSON map of `device_id => { token, env, platform, active, seen_at, deactivated_at? }` (multi-device). Legacy shapes (bare token string, or `device_id => token-string`) are still parsed as ios/production/active. Two structural rules, both load-bearing:
+
+- **`normalize_entry` must round-trip every metadata key** (`active`, `seen_at`, `deactivated_at`): the whole map is rewritten through it on *every* save — per-launch subscribe (even unchanged), env self-correction, partial unsubscribe — so a key it drops is silently erased from all slots within one launch of any device.
+- **All map writes take `DistributedMutex("fcm_device_map_<user_id>")`** and `devices_map` merges duplicate custom-field rows (Array, last row wins) — `user_custom_fields(user_id, name)` has **no unique index**, so racing writes can create dup rows, which previously read as `{}` and wiped every slot on the next save.
+
+The `automatic_subscribe` endpoint (POST; legacy GET kept for old app builds, gated on `X-Requested-With` against SameSite=Lax cross-site navigation) takes the APNs token plus `device_id`, `environment`, `platform`. `token=REMOVE` deletes the slot ("forget this device" — the app's settings toggle); `token=SUSPEND` deactivates it (the app's sign-out). Not staff-serialized (raw tokens + device ids were leaking into user cards / group members / per-post payloads); inspect via rails console.
+
+## Alert invariant
+
+**The confirmation push fires only when an account gains a device it didn't have** — `Pusher.subscribe` returns true only for a brand-new `device_id`, and the confirm targets only that device. Re-subscribes, token rotations, env changes, and reactivations are silent. Everything else about the slot lifecycle exists to preserve that invariant:
+
+- **Deactivate, don't delete** (`active:false` + `deactivated_at`): used by dead-token cleanup (`Unregistered`), the app's sign-out SUSPEND, and the logto plugin's revocation hook (`revocation_trigger.rb` — web logout-this-device / admin / password change; never expiry, which uses `delete_all` and skips callbacks). Delivery skips inactive slots; the tombstone is what keeps the *next* same-account subscribe silent. Deleting instead re-introduces a confirm push on every reinstall whose token died mid-uninstall.
+- **Cross-user token sweep**: registering token T removes T from every other user's map (a physical device belongs to its most recent registrant) — closes the account-switch delivery leak with no client involvement. Runs only when the token actually changed; matches legacy shapes and inactive copies; takes each affected user's mutex.
+- **Env self-correction**: delivery retries the opposite APNs host on `BadDeviceToken` and rewrites the stored `env`. `subscribe` therefore keeps the stored env for an unchanged token (the client hint is a build-static guess; the stored value was proven by an APNs accept) — otherwise the hint and the self-correction flip-flop forever, confirm-pushing every session.
+- **TTL**: `Jobs::SweepFcmStaleDevices` (daily) prunes slots not seen (active, `seen_at`) or not deactivated (`deactivated_at`) within `Pusher::STALE_DEVICE_TTL` (90 days); untimestamped legacy entries are stamped, not pruned. This is what bounds inactive tombstones — they never reach APNs, so they can never be reported dead.
+- **Do NOT hook `:user_logged_out`** — the event carries no device_id; it could only wipe all devices.
 
 ## Prometheus metrics
 
@@ -109,3 +124,5 @@ xcrun simctl push booted <BUNDLE_ID> test_payloads/replied_to_post.apns
 - Legacy FCM gems (`fcm`, `googleauth`, `signet`, `os`, `memoist`) are still registered in `plugin.rb` though nothing uses them
 - Non-iOS platforms (`platform != "ios"`) are logged and skipped — Android/FCM would need a new sender branch in `send_notification`
 - There is no rate limiting (the old inverted `already_sent?` 2-minute limiter was removed entirely)
+- The legacy GET `automatic_subscribe` route survives only for pre-POST app builds — remove it (and its XHR gate) once the TestFlight fleet has adopted the POST client
+- The legacy web `POST /subscribe` action registers under `device_id="legacy"` (no device_id param); it now gates its confirm on the same new-pairing return as `automatic_subscribe` — the iOS app never calls it

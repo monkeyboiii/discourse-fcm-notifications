@@ -29,8 +29,10 @@ end
 require_relative "lib/discourse_fcm_notifications/engine"
 
 after_initialize do
+  # Deliberately NOT staff-serialized: the map holds raw APNs tokens + device ids
+  # (was leaking into user cards / group members / per-post payloads). Inspect via
+  # rails console instead — see CLAUDE.md § Device Token Storage.
   User.register_custom_field_type(DiscourseFcmNotifications::PLUGIN_NAME, :json)
-  allow_staff_user_custom_field DiscourseFcmNotifications::PLUGIN_NAME
 
   DiscourseEvent.on(:push_notification) do |user, payload|
     if SiteSetting.fcm_notifications_enabled?
@@ -68,12 +70,9 @@ after_initialize do
     Jobs.enqueue(:send_fcm_notification_for_row, notification_id: notification.id)
   end
 
-  #DiscourseEvent.on(:user_logged_out) do |user|
-  #  if SiteSetting.fcm_notifications_enabled?
-  #    DiscourseFcmNotifications::Pusher.unsubscribe(user)
-  #    user.save_custom_fields(true)
-  #  end
-  #end
+  # Do NOT hook :user_logged_out for cleanup — the event carries no device_id, so
+  # it could only wipe ALL devices. Sign-out/revocation lifecycle lives in
+  # Pusher.deactivate + the logto plugin's revocation hook (CLAUDE.md § Alert invariant).
 
   require_dependency 'jobs/base'
   module ::Jobs
@@ -93,6 +92,15 @@ after_initialize do
         notification = Notification.find_by(id: args[:notification_id])
         return if notification.nil?
         DiscourseFcmNotifications::Pusher.push_for_notification(notification)
+      end
+    end
+
+    class SweepFcmStaleDevices < ::Jobs::Scheduled
+      every 1.day
+
+      def execute(args)
+        return unless SiteSetting.fcm_notifications_enabled?
+        DiscourseFcmNotifications::Pusher.sweep_stale_devices
       end
     end
   end

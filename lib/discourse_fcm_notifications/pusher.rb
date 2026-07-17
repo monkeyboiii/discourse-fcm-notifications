@@ -2,6 +2,10 @@
 
 module ::DiscourseFcmNotifications
   class Pusher
+    # Inactive slots age on deactivated_at, active ones on seen_at (refreshed by the
+    # per-launch re-subscribe). See CLAUDE.md § Device Token Storage.
+    STALE_DEVICE_TTL = 90.days
+
     # Memoized APNs connection pools (per process), one per environment. Reused
     # across Sidekiq jobs so JWT auth tokens aren't regenerated per push.
     @@apns_pool_prod = nil
@@ -39,7 +43,9 @@ module ::DiscourseFcmNotifications
       )
     end
 
-    def self.confirm_subscribe(user)
+    # Scoped to the registering device — a new pairing must not ping the account's
+    # other devices (CLAUDE.md § Alert invariant).
+    def self.confirm_subscribe(user, device_id = nil)
       message = {
         title: I18n.t(
           "discourse_fcm_notifications.confirm_title",
@@ -48,7 +54,7 @@ module ::DiscourseFcmNotifications
         message: I18n.t("discourse_fcm_notifications.confirm_body"),
         url: "#{Discourse.base_url}"
       }
-      self.send_notification(user, message)
+      self.send_notification(user, message, only_device_id: device_id)
     end
 
     # Push a notification built straight from a `Notification` row. Used by the
@@ -88,38 +94,50 @@ module ::DiscourseFcmNotifications
     end
 
     # The user's registered devices as a Hash of device_id => entry, where each
-    # entry is { "token" =>, "env" =>, "platform" => }. Tolerates older stored
-    # shapes so upgrades are seamless:
+    # entry is { "token" =>, "env" =>, "platform" =>, "active" =>, "seen_at" =>?,
+    # "deactivated_at" =>? }. Tolerates older stored shapes so upgrades are seamless:
     #   - Hash of device_id => entry-hash  (current multi-device format)
     #   - Hash of device_id => token-string (pre-APNs; treated as ios/production)
     #   - String (legacy single-token format)
+    #   - Array (duplicate custom-field rows — no unique index; merged, last row wins)
     #   - nil / blank (no subscription)
     def self.devices_map(user)
-      raw = user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME]
+      normalize_raw_devices(user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME])
+    end
+
+    def self.normalize_raw_devices(raw)
       case raw
+      when Array
+        raw.each_with_object({}) { |element, acc| acc.merge!(normalize_raw_devices(element)) }
       when Hash
         raw.each_with_object({}) do |(device_id, value), acc|
           entry = normalize_entry(value)
           acc[device_id] = entry if entry
         end
       when String
-        raw.blank? ? {} : { "legacy" => { "token" => raw, "env" => "production", "platform" => "ios" } }
+        raw.blank? ? {} : { "legacy" => normalize_entry(raw) }
       else
         {}
       end
     end
 
+    # Every save round-trips the whole map through here, so metadata keys that
+    # don't round-trip are silently erased (CLAUDE.md § Device Token Storage).
     def self.normalize_entry(value)
       if value.is_a?(Hash)
         token = value["token"]
         return nil if token.blank?
-        {
+        entry = {
           "token" => token,
           "env" => value["env"].presence || "production",
-          "platform" => value["platform"].presence || "ios"
+          "platform" => value["platform"].presence || "ios",
+          "active" => value["active"] != false
         }
+        entry["seen_at"] = value["seen_at"] if value["seen_at"].present?
+        entry["deactivated_at"] = value["deactivated_at"] if value["deactivated_at"].present?
+        entry
       elsif value.is_a?(String) && value.present?
-        { "token" => value, "env" => "production", "platform" => "ios" }
+        { "token" => value, "env" => "production", "platform" => "ios", "active" => true }
       end
     end
 
@@ -128,47 +146,157 @@ module ::DiscourseFcmNotifications
     #                only its own slot (multi-device safe). Defaults to "legacy".
     # env          = "sandbox" | "production" (APNs host hint, iOS).
     # platform     = "ios" (default) | "android" (future).
-    # Returns true when this device's token/env/platform changed (caller uses
-    # this to decide whether to send the confirmation push).
+    # Returns true only when device_id is NEW for this user — the one case that
+    # earns the confirmation push (CLAUDE.md § Alert invariant). Token rotation,
+    # env, and reactivation update the slot silently.
     def self.subscribe(user, subscription, device_id = nil, env = nil, platform = nil)
       return false if subscription.blank?
       device_id = device_id.presence || "legacy"
-      entry = {
-        "token" => subscription,
-        "env" => env.presence || "production",
-        "platform" => platform.presence || "ios"
-      }
 
-      map = devices_map(user)
-      previous = map[device_id]
-      # Drop stale entries holding this same token under a different device_id
-      # (token migrated devices, or a reinstall reissued it).
-      map.reject! { |did, e| e["token"] == subscription && did != device_id }
-      map[device_id] = entry
+      new_device = false
+      token_changed = false
+      entry = nil
 
-      user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
-      user.save_custom_fields(true)
+      DistributedMutex.synchronize(map_mutex_key(user.id)) do
+        map = devices_map(user)
+        previous = map[device_id]
+        # Drop stale entries holding this same token under a different device_id
+        # (token migrated devices, or a reinstall reissued it).
+        map.reject! { |did, e| e["token"] == subscription && did != device_id }
 
-      changed = previous != entry
-      if changed
-        record_metric("fcm_device_subscribe_total", "FCM device registrations (new or changed token)", { platform: entry["platform"], env: entry["env"] })
+        entry = {
+          "token" => subscription,
+          "env" => env.presence || "production",
+          "platform" => platform.presence || "ios",
+          "active" => true,
+          "seen_at" => Time.zone.now.iso8601
+        }
+        # env follows the token: a stored env was proven by an APNs accept; the
+        # client hint is a build-static guess (CLAUDE.md § Alert invariant).
+        entry["env"] = previous["env"] if previous && previous["token"] == subscription
+
+        new_device = previous.nil?
+        token_changed = new_device || previous["token"] != subscription
+        map[device_id] = entry
+        save_map(user, map)
       end
-      changed
+
+      if token_changed
+        record_metric("fcm_device_subscribe_total", "FCM device registrations (new or changed token)", { platform: entry["platform"], env: entry["env"] })
+        sweep_token_from_other_users(user, subscription)
+      end
+      new_device
     end
 
     # Remove one device's token (device_id given) or every token (device_id nil,
-    # e.g. the legacy "REMOVE all" behaviour and the dead-token cleanup fallback).
+    # e.g. the legacy "REMOVE all" behaviour).
     def self.unsubscribe(user, device_id = nil)
-      if device_id.present?
-        map = devices_map(user)
-        map.delete(device_id)
-        if map.empty?
-          user.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
+      DistributedMutex.synchronize(map_mutex_key(user.id)) do
+        if device_id.present?
+          map = devices_map(user)
+          map.delete(device_id)
+          save_map(user, map)
         else
-          user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
+          user.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
+          user.save_custom_fields(true)
         end
-      else
+      end
+    end
+
+    # Delivery stops but the slot survives as a tombstone, so the device's next
+    # subscribe reactivates it silently — no confirmation push. Used by dead-token
+    # cleanup (which passes expected_token so a slot re-registered mid-delivery is
+    # left alone), the iOS sign-out suspend, and the logto plugin's revocation hook.
+    def self.deactivate(user, device_id, expected_token: nil)
+      return if device_id.blank?
+      DistributedMutex.synchronize(map_mutex_key(user.id)) do
+        # Fresh read: the caller's instance memoizes custom_fields, which may be
+        # seconds old by now (CLAUDE.md § Device Token Storage).
+        fresh = User.find_by(id: user.id)
+        next unless fresh
+        map = devices_map(fresh)
+        entry = map[device_id]
+        next if entry.nil? || entry["active"] == false
+        next if expected_token && entry["token"] != expected_token
+        entry["active"] = false
+        entry["deactivated_at"] = Time.zone.now.iso8601
+        map[device_id] = entry
+        save_map(fresh, map)
+      end
+    end
+
+    # A physical device belongs to its most recent registrant: registering token T
+    # here removes T from every OTHER user's map (account-switch delivery leak).
+    def self.sweep_token_from_other_users(user, token)
+      UserCustomField
+        .where(name: DiscourseFcmNotifications::PLUGIN_NAME)
+        .where.not(user_id: user.id)
+        .where("value LIKE ?", "%#{ActiveRecord::Base.sanitize_sql_like(token)}%")
+        .distinct
+        .pluck(:user_id)
+        .each do |other_id|
+          other = User.find_by(id: other_id)
+          next unless other
+          DistributedMutex.synchronize(map_mutex_key(other_id)) do
+            map = devices_map(other)
+            next unless map.reject! { |_did, e| e["token"] == token }
+            save_map(other, map)
+          end
+        end
+    rescue => e
+      Rails.logger.warn("FCM: cross-user token sweep failed: #{e.class}: #{e.message}")
+    end
+
+    # Daily prune (Jobs::SweepFcmStaleDevices). Untimestamped entries are stamped,
+    # not pruned, so pre-metadata registrations get one full TTL of grace.
+    def self.sweep_stale_devices
+      UserCustomField
+        .where(name: DiscourseFcmNotifications::PLUGIN_NAME)
+        .distinct
+        .pluck(:user_id)
+        .each do |user_id|
+          user = User.find_by(id: user_id)
+          next unless user
+          DistributedMutex.synchronize(map_mutex_key(user_id)) do
+            now = Time.zone.now
+            cutoff = now - STALE_DEVICE_TTL
+            dirty = false
+            map = devices_map(user)
+            pruned = map.reject do |_did, entry|
+              ts = entry["active"] ? entry["seen_at"] : (entry["deactivated_at"] || entry["seen_at"])
+              parsed = parse_time(ts)
+              if parsed.nil?
+                entry["seen_at"] = now.iso8601
+                dirty = true
+                false
+              elsif parsed < cutoff
+                dirty = true
+                true
+              else
+                false
+              end
+            end
+            save_map(user, pruned) if dirty
+          end
+        end
+    end
+
+    def self.parse_time(value)
+      return nil if value.blank?
+      Time.zone.parse(value)
+    rescue ArgumentError, TypeError
+      nil
+    end
+
+    def self.map_mutex_key(user_id)
+      "fcm_device_map_#{user_id}"
+    end
+
+    def self.save_map(user, map)
+      if map.empty?
         user.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
+      else
+        user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
       end
       user.save_custom_fields(true)
     end
@@ -199,10 +327,12 @@ module ::DiscourseFcmNotifications
       data
     end
 
-    def self.send_notification(user, message_hash)
+    def self.send_notification(user, message_hash, only_device_id: nil)
       return false unless user && message_hash
 
       map = devices_map(user)
+      map = map.slice(only_device_id) if only_device_id
+      map = map.reject { |_did, entry| entry["active"] == false }
       if map.empty?
         Rails.logger.info "Push: no device tokens registered for #{user.username}, skipping push about #{message_hash[:title]}"
         return false
@@ -221,16 +351,11 @@ module ::DiscourseFcmNotifications
             record_metric("fcm_push_total", "APNs push send outcomes", { result: "ok", env: used_env })
             Rails.logger.info "APNs: sent '#{message_hash[:title]}' to #{user.username} (device #{device_id}, env #{used_env})"
             # Self-correct a wrong env hint discovered via BadDeviceToken.
-            if used_env != entry["env"]
-              entry["env"] = used_env
-              map[device_id] = entry
-              user.custom_fields[DiscourseFcmNotifications::PLUGIN_NAME] = map
-              user.save_custom_fields(true)
-            end
+            update_device_env(user, device_id, used_env) if used_env != entry["env"]
           when :dead
             record_metric("fcm_push_total", "APNs push send outcomes", { result: "dead", env: entry["env"] })
-            Rails.logger.error "APNs: token for #{user.username} (device #{device_id}) is no longer valid; removing it"
-            dead_device_ids << device_id
+            Rails.logger.error "APNs: token for #{user.username} (device #{device_id}) is no longer valid; deactivating it"
+            dead_device_ids << [device_id, entry["token"]]
           else
             record_metric("fcm_push_total", "APNs push send outcomes", { result: "error", env: entry["env"] })
             Rails.logger.error "APNs: failed to send to #{user.username} (device #{device_id})"
@@ -242,8 +367,24 @@ module ::DiscourseFcmNotifications
         end
       end
 
-      dead_device_ids.each { |did| unsubscribe(user, did) }
+      # Deactivate, don't delete: the tombstone keeps a same-account reinstall
+      # silent after the uninstalled window killed the token (CLAUDE.md).
+      dead_device_ids.each { |did, dead_token| deactivate(user, did, expected_token: dead_token) }
       sent_any
+    end
+
+    def self.update_device_env(user, device_id, env)
+      DistributedMutex.synchronize(map_mutex_key(user.id)) do
+        # Fresh read — same staleness hazard as deactivate.
+        fresh = User.find_by(id: user.id)
+        next unless fresh
+        map = devices_map(fresh)
+        entry = map[device_id]
+        next if entry.nil? || entry["env"] == env
+        entry["env"] = env
+        map[device_id] = entry
+        save_map(fresh, map)
+      end
     end
 
     # Returns [result, used_env] where result is :ok | :dead | :error.
