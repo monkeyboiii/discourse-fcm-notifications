@@ -158,7 +158,11 @@ module ::DiscourseFcmNotifications
       entry = nil
 
       DistributedMutex.synchronize(map_mutex_key(user.id)) do
-        map = devices_map(user)
+        # Fresh read: the caller's instance memoizes custom_fields (CLAUDE.md
+        # § Device Token Storage).
+        fresh = User.find_by(id: user.id)
+        next unless fresh
+        map = devices_map(fresh)
         previous = map[device_id]
         # Drop stale entries holding this same token under a different device_id
         # (token migrated devices, or a reinstall reissued it).
@@ -178,7 +182,7 @@ module ::DiscourseFcmNotifications
         new_device = previous.nil?
         token_changed = new_device || previous["token"] != subscription
         map[device_id] = entry
-        save_map(user, map)
+        save_map(fresh, map)
       end
 
       if token_changed
@@ -192,13 +196,15 @@ module ::DiscourseFcmNotifications
     # e.g. the legacy "REMOVE all" behaviour).
     def self.unsubscribe(user, device_id = nil)
       DistributedMutex.synchronize(map_mutex_key(user.id)) do
+        fresh = User.find_by(id: user.id)
+        next unless fresh
         if device_id.present?
-          map = devices_map(user)
+          map = devices_map(fresh)
           map.delete(device_id)
-          save_map(user, map)
+          save_map(fresh, map)
         else
-          user.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
-          user.save_custom_fields(true)
+          fresh.custom_fields.delete(DiscourseFcmNotifications::PLUGIN_NAME)
+          fresh.save_custom_fields(true)
         end
       end
     end
@@ -329,6 +335,10 @@ module ::DiscourseFcmNotifications
 
     def self.send_notification(user, message_hash, only_device_id: nil)
       return false unless user && message_hash
+      # Fresh instance: the caller's memoized custom_fields may predate the very
+      # write this notification is about.
+      user = User.find_by(id: user.id)
+      return false unless user
 
       map = devices_map(user)
       map = map.slice(only_device_id) if only_device_id
